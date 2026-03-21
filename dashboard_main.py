@@ -14,18 +14,20 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, date
+from collections import deque
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any
 
 import requests
-from PySide6.QtCore import QObject, Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtCore import QObject, Qt, QThread, Signal, QTimer, QRectF
+from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QPen, QBrush
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QLineEdit,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -43,6 +45,345 @@ from PySide6.QtWidgets import (
 
 from src.utils.config import Config
 from src.utils.ui_theme import apply_command_center_theme
+
+
+class LiveTrackMapWidget(QWidget):
+    """Lightweight live track map from OpenF1 location coordinates."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setMinimumHeight(260)
+        self.rows: list[dict[str, Any]] = []
+        self.traces: dict[int, deque[tuple[float, float]]] = {}
+
+    def set_rows(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        for row in rows:
+            driver_number = row.get("driver_number")
+            x = row.get("x")
+            y = row.get("y")
+            if driver_number is None or x is None or y is None:
+                continue
+
+            dnum = int(driver_number)
+            if dnum not in self.traces:
+                self.traces[dnum] = deque(maxlen=220)
+            self.traces[dnum].append((float(x), float(y)))
+
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        painter.setPen(QPen(QColor("#1E3C4A"), 1))
+        painter.setBrush(QBrush(QColor("#0D161D")))
+        painter.drawRoundedRect(rect, 12, 12)
+
+        points: list[tuple[int, float, float]] = []
+        for row in self.rows:
+            d = row.get("driver_number")
+            x = row.get("x")
+            y = row.get("y")
+            if d is None or x is None or y is None:
+                continue
+            points.append((int(d), float(x), float(y)))
+
+        if not points:
+            painter.setPen(QColor("#92A3A8"))
+            painter.drawText(rect, Qt.AlignCenter, "Waiting for live location stream...")
+            painter.end()
+            return
+
+        all_trace_points: list[tuple[float, float]] = []
+        for trace in self.traces.values():
+            all_trace_points.extend(list(trace))
+
+        if all_trace_points:
+            xs = [p[0] for p in all_trace_points]
+            ys = [p[1] for p in all_trace_points]
+        else:
+            xs = [p[1] for p in points]
+            ys = [p[2] for p in points]
+
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        span_x = max(max_x - min_x, 1.0)
+        span_y = max(max_y - min_y, 1.0)
+
+        draw_area = rect.adjusted(18, 18, -18, -18)
+
+        def to_canvas(x: float, y: float) -> tuple[float, float]:
+            nx = (x - min_x) / span_x
+            ny = (y - min_y) / span_y
+            cx = draw_area.left() + nx * draw_area.width()
+            cy = draw_area.bottom() - ny * draw_area.height()
+            return cx, cy
+
+        # Draw recent traces
+        for dnum, trace in self.traces.items():
+            if len(trace) < 2:
+                continue
+            color = self._driver_color(dnum)
+            painter.setPen(QPen(color, 1.8))
+            it = list(trace)
+            for i in range(1, len(it)):
+                x1, y1 = to_canvas(it[i - 1][0], it[i - 1][1])
+                x2, y2 = to_canvas(it[i][0], it[i][1])
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        # Draw current points
+        for dnum, x, y in points:
+            cx, cy = to_canvas(x, y)
+            color = self._driver_color(dnum)
+            painter.setPen(QPen(QColor("#0A1014"), 1))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(QRectF(cx - 5, cy - 5, 10, 10))
+
+            painter.setPen(QColor("#E8EEF0"))
+            painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            painter.drawText(int(cx + 7), int(cy - 7), str(dnum))
+
+        painter.setPen(QColor("#16E0D6"))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        painter.drawText(rect.adjusted(8, 6, -8, -6), Qt.AlignTop | Qt.AlignLeft, "Live Track Map")
+        painter.end()
+
+    @staticmethod
+    def _driver_color(driver_number: int) -> QColor:
+        palette = [
+            QColor("#16E0D6"), QColor("#FF4D4D"), QColor("#FFD166"), QColor("#7BD389"),
+            QColor("#4D96FF"), QColor("#B388EB"), QColor("#F4A261"), QColor("#06D6A0"),
+        ]
+        return palette[driver_number % len(palette)]
+
+
+def request_json_with_retry(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: int = 12,
+    retries: int = 2,
+    backoff_seconds: float = 1.0,
+) -> Any:
+    """Small production-safe HTTP GET helper with retries and backoff."""
+    headers = {"accept": "application/json"}
+    if Config.OPENF1_ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {Config.OPENF1_ACCESS_TOKEN}"
+
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(backoff_seconds * (attempt + 1))
+    raise RuntimeError(f"Request failed after retries for {url}: {last_exc}")
+
+
+class LiveRaceWorker(QObject):
+    """Background worker for resilient OpenF1 live telemetry polling."""
+
+    status_changed = Signal(str)
+    telemetry_loaded = Signal(list)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, session_key: int | str):
+        super().__init__()
+        self.session_key = session_key
+        self._running = True
+        self._driver_cache: dict[int, dict[str, Any]] = {}
+        self._driver_order: list[dict[str, Any]] = []
+        self._round_robin_index = 0
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        try:
+            self.status_changed.emit(f"Connecting to OpenF1 session {self.session_key}...")
+
+            while self._running:
+                try:
+                    drivers = self._fetch_drivers()
+                    if drivers:
+                        self._driver_order = drivers
+
+                    self._poll_positions_recent()
+                    self._poll_locations_recent()
+                    self._poll_driver_chunks(chunk_size=5)
+                    table_rows = self._build_rows()
+                    self.telemetry_loaded.emit(table_rows)
+                    self.status_changed.emit(
+                        f"Live telemetry connected • Session {self.session_key} • Drivers {len(self._driver_order)}"
+                    )
+                except Exception as exc:
+                    self.failed.emit(f"Live polling error: {exc}")
+                    self.status_changed.emit("Live polling degraded - retrying...")
+
+                for _ in range(10):  # 10 * 300ms = 3s loop
+                    if not self._running:
+                        break
+                    time.sleep(0.3)
+        finally:
+            self.finished.emit()
+
+    def _fetch_drivers(self) -> list[dict[str, Any]]:
+        payload = request_json_with_retry(
+            f"{Config.OPENF1_BASE_URL}/drivers",
+            params={"session_key": self.session_key},
+            timeout=10,
+            retries=2,
+        )
+        return payload if isinstance(payload, list) else []
+
+    def _poll_driver_chunks(self, chunk_size: int = 5) -> None:
+        if not self._driver_order:
+            return
+
+        # Always keep a complete baseline row-set (name/team/position) for all drivers.
+        for d in self._driver_order:
+            driver_number = d.get("driver_number")
+            if driver_number is None:
+                continue
+            driver_id = int(driver_number)
+            existing = self._driver_cache.get(driver_id, {})
+            self._driver_cache[driver_id] = {
+                "driver_number": driver_number,
+                "name": d.get("full_name") or d.get("name_acronym") or existing.get("name") or "Unknown",
+                "team": d.get("team_name") or existing.get("team") or "Unknown",
+                "position": d.get("position") or existing.get("position") or 99,
+                "speed": existing.get("speed"),
+                "gear": existing.get("gear"),
+                "throttle": existing.get("throttle"),
+                "brake": existing.get("brake"),
+                "x": existing.get("x"),
+                "y": existing.get("y"),
+                "updated": existing.get("updated") or "-",
+            }
+
+        total = len(self._driver_order)
+        start = self._round_robin_index
+        end = min(start + chunk_size, total)
+        current = self._driver_order[start:end]
+        if end >= total:
+            overflow = (start + chunk_size) - total
+            if overflow > 0:
+                current += self._driver_order[:overflow]
+            self._round_robin_index = overflow
+        else:
+            self._round_robin_index = end
+
+        for d in current:
+            driver_number = d.get("driver_number")
+            if driver_number is None:
+                continue
+
+            driver_id = int(driver_number)
+
+            try:
+                recent_iso = (datetime.utcnow() - timedelta(seconds=45)).isoformat() + "Z"
+                car_data = request_json_with_retry(
+                    f"{Config.OPENF1_BASE_URL}/car_data",
+                    params={
+                        "session_key": self.session_key,
+                        "driver_number": driver_number,
+                        "date>=": recent_iso,
+                    },
+                    timeout=6,
+                    retries=1,
+                )
+
+                # Fallback for non-live/historical sessions where recent window may be empty.
+                if not car_data:
+                    car_data = request_json_with_retry(
+                        f"{Config.OPENF1_BASE_URL}/car_data",
+                        params={"session_key": self.session_key, "driver_number": driver_number},
+                        timeout=6,
+                        retries=0,
+                    )
+                latest = car_data[-1] if isinstance(car_data, list) and car_data else {}
+
+                self._driver_cache[driver_id] = {
+                    "driver_number": driver_number,
+                    "name": d.get("full_name") or d.get("name_acronym") or "Unknown",
+                    "team": d.get("team_name") or "Unknown",
+                    "position": self._driver_cache[driver_id].get("position") or d.get("position") or 99,
+                    "speed": latest.get("speed"),
+                    "gear": latest.get("n_gear") or latest.get("gear"),
+                    "throttle": latest.get("throttle"),
+                    "brake": latest.get("brake"),
+                    "x": self._driver_cache[driver_id].get("x"),
+                    "y": self._driver_cache[driver_id].get("y"),
+                    "updated": datetime.utcnow().strftime("%H:%M:%S"),
+                }
+            except Exception:
+                # Keep last known data; fail soft for production resilience.
+                continue
+
+    def _poll_positions_recent(self) -> None:
+        try:
+            recent_iso = (datetime.utcnow() - timedelta(seconds=45)).isoformat() + "Z"
+            payload = request_json_with_retry(
+                f"{Config.OPENF1_BASE_URL}/position",
+                params={"session_key": self.session_key, "date>=": recent_iso},
+                timeout=6,
+                retries=1,
+            )
+            if not isinstance(payload, list):
+                return
+
+            latest_by_driver: dict[int, dict[str, Any]] = {}
+            for item in payload:
+                dnum = item.get("driver_number")
+                if dnum is None:
+                    continue
+                latest_by_driver[int(dnum)] = item
+
+            for dnum, item in latest_by_driver.items():
+                existing = self._driver_cache.get(dnum, {})
+                existing["position"] = item.get("position", existing.get("position", 99))
+                self._driver_cache[dnum] = existing
+        except Exception:
+            return
+
+    def _poll_locations_recent(self) -> None:
+        try:
+            recent_iso = (datetime.utcnow() - timedelta(seconds=45)).isoformat() + "Z"
+            payload = request_json_with_retry(
+                f"{Config.OPENF1_BASE_URL}/location",
+                params={"session_key": self.session_key, "date>=": recent_iso},
+                timeout=6,
+                retries=1,
+            )
+            if not isinstance(payload, list):
+                return
+
+            latest_by_driver: dict[int, dict[str, Any]] = {}
+            for item in payload:
+                dnum = item.get("driver_number")
+                if dnum is None:
+                    continue
+                latest_by_driver[int(dnum)] = item
+
+            for dnum, item in latest_by_driver.items():
+                existing = self._driver_cache.get(dnum, {})
+                existing["x"] = item.get("x", existing.get("x"))
+                existing["y"] = item.get("y", existing.get("y"))
+                self._driver_cache[dnum] = existing
+        except Exception:
+            return
+
+    def _build_rows(self) -> list[dict[str, Any]]:
+        rows = list(self._driver_cache.values())
+        rows.sort(key=lambda x: (x.get("position") is None, x.get("position", 999)))
+        return rows
 
 
 class DashboardDataWorker(QObject):
@@ -300,6 +641,8 @@ class DashboardWindow(QMainWindow):
 
         self.articles: list[dict[str, Any]] = []
         self.next_race_date: date | None = None
+        self.live_worker: LiveRaceWorker | None = None
+        self.live_thread: QThread | None = None
 
         root = QWidget()
         root_layout = QHBoxLayout(root)
@@ -424,24 +767,191 @@ class DashboardWindow(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        title = QLabel("Live Races (Streaming Staging)")
+        title = QLabel("Live Race Monitor")
+        title.setObjectName("sectionTitle")
         title.setFont(QFont("Segoe UI", 18, QFont.Bold))
         layout.addWidget(title)
 
-        body = QLabel(
-            "This module is your launch pad for live match workflows.\n"
-            "Use Replay from the sidebar for the current Tom Shaw desktop replay.\n"
-            "You can expand this page next with OpenF1 live driver/session selectors."
-        )
-        body.setWordWrap(True)
-        layout.addWidget(body)
+        controls = QHBoxLayout()
+        controls.setSpacing(10)
 
-        launch_replay_from_live = QPushButton("Launch Replay Now")
-        launch_replay_from_live.clicked.connect(self.launch_replay)
-        layout.addWidget(launch_replay_from_live)
+        self.live_session_input = QLineEdit()
+        self.live_session_input.setPlaceholderText("OpenF1 session key (e.g. 9158)")
+        self.live_session_input.setMinimumHeight(38)
+
+        self.detect_session_btn = QPushButton("Auto Detect Session")
+        self.detect_session_btn.clicked.connect(self._auto_detect_live_session)
+        self.detect_session_btn.setMinimumHeight(38)
+
+        self.start_live_btn = QPushButton("Start Live")
+        self.start_live_btn.setObjectName("primaryButton")
+        self.start_live_btn.clicked.connect(self._start_live_monitor)
+        self.start_live_btn.setMinimumHeight(38)
+
+        self.stop_live_btn = QPushButton("Stop Live")
+        self.stop_live_btn.clicked.connect(self._stop_live_monitor)
+        self.stop_live_btn.setMinimumHeight(38)
+        self.stop_live_btn.setEnabled(False)
+
+        controls.addWidget(self.live_session_input, 1)
+        controls.addWidget(self.detect_session_btn)
+        controls.addWidget(self.start_live_btn)
+        controls.addWidget(self.stop_live_btn)
+        layout.addLayout(controls)
+
+        self.live_status = QLabel("Live monitor idle")
+        self.live_status.setObjectName("mutedText")
+        self.live_status.setWordWrap(True)
+        layout.addWidget(self.live_status)
+
+        self.live_track_map = LiveTrackMapWidget()
+        layout.addWidget(self.live_track_map)
+
+        self.live_table = QTableWidget(0, 8)
+        self.live_table.setHorizontalHeaderLabels(
+            ["Pos", "Driver #", "Driver", "Team", "Speed", "Gear", "Throttle", "Brake"]
+        )
+        self.live_table.setAlternatingRowColors(True)
+        self.live_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.live_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.live_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.live_table, 1)
 
         layout.addStretch(1)
         return page
+
+    def _auto_detect_live_session(self) -> None:
+        self.live_status.setText("Detecting latest active session...")
+        try:
+            year = datetime.utcnow().year
+            payload = request_json_with_retry(
+                f"{Config.OPENF1_BASE_URL}/sessions",
+                params={"year": year},
+                timeout=12,
+                retries=1,
+            )
+            sessions = payload if isinstance(payload, list) else []
+            if not sessions:
+                self.live_status.setText("No sessions returned by OpenF1. Enter session key manually.")
+                return
+
+            def _dt(value: str | None) -> datetime:
+                if not value:
+                    return datetime.min
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except Exception:
+                    return datetime.min
+
+            now = datetime.utcnow().replace(tzinfo=None)
+            preferred = [
+                s for s in sessions
+                if str(s.get("session_name", "")).lower() in {"qualifying", "race", "sprint", "sprint qualifying"}
+            ]
+            preferred.sort(key=lambda s: _dt(s.get("date_start")), reverse=True)
+
+            picked = None
+            for s in preferred:
+                start = _dt(s.get("date_start"))
+                end = _dt(s.get("date_end"))
+                if start <= now <= (end if end != datetime.min else now):
+                    picked = s
+                    break
+
+            if picked is None:
+                picked = preferred[0] if preferred else sessions[0]
+
+            key = picked.get("session_key")
+            if key is None:
+                self.live_status.setText("Could not extract session key. Enter key manually.")
+                return
+
+            self.live_session_input.setText(str(key))
+            name = picked.get("session_name", "Session")
+            event = picked.get("country_name") or picked.get("location") or "Unknown"
+            self.live_status.setText(f"Detected {name} • {event} • session_key={key}")
+        except Exception as exc:
+            self.live_session_input.setText("latest")
+            self.live_status.setText(
+                f"Auto detect failed: {exc}. Falling back to session_key=latest for live mode."
+            )
+
+    def _start_live_monitor(self) -> None:
+        session_key_text = self.live_session_input.text().strip()
+        if not (session_key_text.isdigit() or session_key_text.lower() == "latest"):
+            QMessageBox.warning(
+                self,
+                "Invalid session key",
+                "Please enter a numeric OpenF1 session key or 'latest'.",
+            )
+            return
+
+        session_key: int | str = int(session_key_text) if session_key_text.isdigit() else "latest"
+        self._stop_live_monitor(silent=True)
+
+        self.live_thread = QThread(self)
+        self.live_worker = LiveRaceWorker(session_key=session_key)
+        self.live_worker.moveToThread(self.live_thread)
+
+        self.live_thread.started.connect(self.live_worker.run)
+        self.live_worker.status_changed.connect(self._on_live_status)
+        self.live_worker.telemetry_loaded.connect(self._on_live_telemetry)
+        self.live_worker.failed.connect(self._on_live_error)
+        self.live_worker.finished.connect(self.live_thread.quit)
+        self.live_worker.finished.connect(self.live_worker.deleteLater)
+        self.live_thread.finished.connect(self.live_thread.deleteLater)
+
+        self.live_thread.start()
+        self.start_live_btn.setEnabled(False)
+        self.stop_live_btn.setEnabled(True)
+        self.detect_session_btn.setEnabled(False)
+        self.live_status.setText(f"Starting live monitor for session {session_key}...")
+
+    def _stop_live_monitor(self, silent: bool = False) -> None:
+        if self.live_worker is not None:
+            self.live_worker.stop()
+
+        if self.live_thread is not None and self.live_thread.isRunning():
+            self.live_thread.quit()
+            self.live_thread.wait(2000)
+
+        self.live_worker = None
+        self.live_thread = None
+
+        self.start_live_btn.setEnabled(True)
+        self.stop_live_btn.setEnabled(False)
+        self.detect_session_btn.setEnabled(True)
+        if hasattr(self, "live_track_map") and isinstance(self.live_track_map, LiveTrackMapWidget):
+            self.live_track_map.set_rows([])
+            self.live_track_map.traces.clear()
+        if not silent:
+            self.live_status.setText("Live monitor stopped")
+
+    def _on_live_status(self, status: str) -> None:
+        self.live_status.setText(status)
+
+    def _on_live_error(self, message: str) -> None:
+        self.live_status.setText(message)
+
+    def _on_live_telemetry(self, rows: list[dict[str, Any]]) -> None:
+        if hasattr(self, "live_track_map") and isinstance(self.live_track_map, LiveTrackMapWidget):
+            self.live_track_map.set_rows(rows)
+
+        self.live_table.setRowCount(0)
+        for idx, row in enumerate(rows):
+            self.live_table.insertRow(idx)
+            self.live_table.setItem(idx, 0, QTableWidgetItem(str(row.get("position", "-"))))
+            self.live_table.setItem(idx, 1, QTableWidgetItem(str(row.get("driver_number", "-"))))
+            self.live_table.setItem(idx, 2, QTableWidgetItem(str(row.get("name", "Unknown"))))
+            self.live_table.setItem(idx, 3, QTableWidgetItem(str(row.get("team", "Unknown"))))
+
+            speed = row.get("speed")
+            self.live_table.setItem(idx, 4, QTableWidgetItem(f"{speed} km/h" if speed is not None else "-"))
+            self.live_table.setItem(idx, 5, QTableWidgetItem(str(row.get("gear", "-"))))
+            throttle = row.get("throttle")
+            brake = row.get("brake")
+            self.live_table.setItem(idx, 6, QTableWidgetItem(f"{throttle}%" if throttle is not None else "-"))
+            self.live_table.setItem(idx, 7, QTableWidgetItem(f"{brake}%" if brake is not None else "-"))
 
     def _build_news_page(self) -> QWidget:
         page = QWidget()
@@ -645,6 +1155,10 @@ class DashboardWindow(QMainWindow):
             self.statusBar().showMessage("Launched F1 Race Replay", 5000)
         except Exception as exc:
             QMessageBox.critical(self, "Launch Error", f"Failed to launch replay:\n{exc}")
+
+    def closeEvent(self, event) -> None:
+        self._stop_live_monitor(silent=True)
+        super().closeEvent(event)
 
     @staticmethod
     def _info_card(title: str, value: str) -> QFrame:

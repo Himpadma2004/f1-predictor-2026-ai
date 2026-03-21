@@ -20,6 +20,7 @@ class Config:
     # ============ API KEYS & AUTHENTICATION ============
     GEMINI_API_KEY: str = os.getenv('GEMINI_API_KEY', '')
     NEWS_API_KEY: str = os.getenv('NEWS_API_KEY', '')
+    OPENF1_ACCESS_TOKEN: str = os.getenv('OPENF1_ACCESS_TOKEN', '')
 
     # ============ BASE URLs ============
     OPENF1_BASE_URL: str = os.getenv('OPENF1_BASE_URL', 'https://api.openf1.org/v1')
@@ -79,6 +80,7 @@ Config.validate()
 # Export for easy access
 GEMINI_API_KEY = Config.GEMINI_API_KEY
 NEWS_API_KEY = Config.NEWS_API_KEY
+OPENF1_ACCESS_TOKEN = Config.OPENF1_ACCESS_TOKEN
 OPENF1_BASE_URL = Config.OPENF1_BASE_URL
 JOLPICA_BASE_URL = Config.JOLPICA_BASE_URL
 JOLPICA_2026_BASE_URL = Config.JOLPICA_2026_BASE_URL
