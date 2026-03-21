@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import QMainWindow, QStatusBar, QLabel
 from PySide6.QtCore import Qt
 from src.services.stream import TelemetryStreamClient
+from src.gui.theme import apply_command_center_theme
 
 
 class PitWallWindow(QMainWindow):
@@ -24,6 +25,7 @@ class PitWallWindow(QMainWindow):
         
         # Call subclass UI setup
         self.setup_ui()
+        apply_command_center_theme(self)
         
         # Start client
         self.client.start()

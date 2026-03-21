@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox
+    QLabel, QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox,
+    QSplitter
 )
 from PySide6.QtWidgets import QProgressDialog
 from PySide6.QtCore import QThread, Signal, Qt, QTimer
@@ -13,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from src.f1_data import get_race_weekends_by_year, get_race_weekends_by_place, get_all_unique_race_names, load_session
 from src.gui.settings_dialog import SettingsDialog
+from src.gui.theme import apply_command_center_theme
 from src.lib.season import get_season
 
 # Worker thread to fetch schedule without blocking UI
@@ -51,6 +53,7 @@ class RaceSelectionWindow(QMainWindow):
         self.resize(1000, 700)
         self.setMinimumSize(800, 600)
         self.setWindowState(self.windowState())
+        apply_command_center_theme(self)
 
     def _setup_ui(self):
         central_widget = QWidget()
@@ -62,12 +65,14 @@ class RaceSelectionWindow(QMainWindow):
         # Header (title)
         header_layout = QHBoxLayout()
         header_label = QLabel("F1 Race Replay 🏎️")
+        header_label.setObjectName("pageTitle")
         font = header_label.font()
         settings_btn = QPushButton("⚙ Settings")
+        settings_btn.setObjectName("primaryButton")
         settings_btn.setCursor(Qt.PointingHandCursor)
-        settings_btn.setFixedHeight(32)
+        settings_btn.setMinimumHeight(38)
         settings_btn.clicked.connect(self.open_settings)
-        font.setPointSize(18)
+        font.setPointSize(22)
         font.setBold(True)
         header_label.setFont(font)
         header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -88,6 +93,7 @@ class RaceSelectionWindow(QMainWindow):
 
         self.year_combo.setCurrentText(str(self.current_year))
         self.year_combo.currentTextChanged.connect(self.load_by_year)
+        self.year_combo.setMinimumHeight(38)
 
         year_layout.addWidget(year_label)
         year_layout.addWidget(self.year_combo)
@@ -100,6 +106,7 @@ class RaceSelectionWindow(QMainWindow):
         self.place_combo.addItem("All Races")
         self.place_combo.addItems(get_all_unique_race_names())
         self.place_combo.currentTextChanged.connect(self.load_by_place)
+        self.place_combo.setMinimumHeight(38)
 
 
         place_layout.addWidget(place_label)
@@ -107,13 +114,14 @@ class RaceSelectionWindow(QMainWindow):
         main_layout.addLayout(place_layout)
 
         # Main content: left = schedule, right = session list
-        content_layout = QHBoxLayout()
+        content_splitter = QSplitter(Qt.Horizontal)
+        content_splitter.setChildrenCollapsible(False)
 
         # Schedule tree (left)
         self.schedule_tree = QTreeWidget()
         self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
         self.schedule_tree.setRootIsDecorated(False)
-        content_layout.addWidget(self.schedule_tree, 3)
+        content_splitter.addWidget(self.schedule_tree)
         self.schedule_tree.setColumnWidth(2, 180)
 
         # Session panel (right)
@@ -134,9 +142,12 @@ class RaceSelectionWindow(QMainWindow):
         self.session_list_container.setLayout(self.session_list_layout)
         self.session_panel_layout.addWidget(self.session_list_container)
 
-        content_layout.addWidget(self.session_panel, 1)
+        content_splitter.addWidget(self.session_panel)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
+        content_splitter.setSizes([650, 350])
 
-        main_layout.addLayout(content_layout)
+        main_layout.addWidget(content_splitter, 1)
 
         # connect click handler
         self.schedule_tree.itemClicked.connect(self.on_race_clicked)

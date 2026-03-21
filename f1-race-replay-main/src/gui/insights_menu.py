@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
+from src.gui.theme import apply_command_center_theme
 
 
 class InsightsMenu(QMainWindow):
@@ -12,12 +13,14 @@ class InsightsMenu(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("F1 Insights")
-        self.setGeometry(50, 50, 300, 600)
+        self.setGeometry(50, 50, 380, 720)
+        self.setMinimumSize(340, 620)
         
         # Keep references to opened windows
         self.opened_windows = []
         
         self.setup_ui()
+        apply_command_center_theme(self)
     
     def setup_ui(self):
         # Central widget
@@ -83,10 +86,12 @@ class InsightsMenu(QMainWindow):
         layout = QVBoxLayout(header)
         
         title = QLabel("🏎️ F1 Insights")
+        title.setObjectName("pageTitle")
         title.setFont(QFont("Arial", 24, QFont.Bold))
         layout.addWidget(title)
         
         subtitle = QLabel("Launch telemetry insights and analysis tools")
+        subtitle.setObjectName("mutedText")
         subtitle.setFont(QFont("Arial", 11))
         layout.addWidget(subtitle)
         
@@ -120,6 +125,7 @@ class InsightsMenu(QMainWindow):
         
         # Category label
         category_label = QLabel(category_name.upper())
+        category_label.setObjectName("sectionTitle")
         category_label.setFont(QFont("Arial", 12, QFont.Bold))
         layout.addWidget(category_label)
         

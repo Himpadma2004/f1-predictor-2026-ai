@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from src.gui.theme import apply_command_center_theme
 from src.lib.settings import get_settings
 
 
@@ -29,11 +30,13 @@ class SettingsDialog(QDialog):
         self.settings = get_settings()
         self._setup_ui()
         self._load_current_settings()
+        apply_command_center_theme(self)
 
     def _setup_ui(self):
         """Set up the dialog UI."""
         self.setWindowTitle("Settings")
         self.setMinimumWidth(500)
+        self.setMinimumHeight(360)
         self.setModal(True)
 
         layout = QVBoxLayout()

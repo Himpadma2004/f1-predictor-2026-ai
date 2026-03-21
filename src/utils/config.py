@@ -24,6 +24,8 @@ class Config:
     # ============ BASE URLs ============
     OPENF1_BASE_URL: str = os.getenv('OPENF1_BASE_URL', 'https://api.openf1.org/v1')
     JOLPICA_BASE_URL: str = os.getenv('JOLPICA_BASE_URL', 'http://api.jolpi.ca/ergast/f1')
+    JOLPICA_2026_BASE_URL: str = os.getenv('JOLPICA_2026_BASE_URL', 'http://api.jolpi.ca/ergast/f1/2026')
+    OPEN_METEO_BASE_URL: str = os.getenv('OPEN_METEO_BASE_URL', 'https://api.open-meteo.com/v1/forecast')
 
     # ============ APPLICATION SETTINGS ============
     DEBUG: bool = os.getenv('DEBUG', 'False').lower() == 'true'
@@ -79,3 +81,5 @@ GEMINI_API_KEY = Config.GEMINI_API_KEY
 NEWS_API_KEY = Config.NEWS_API_KEY
 OPENF1_BASE_URL = Config.OPENF1_BASE_URL
 JOLPICA_BASE_URL = Config.JOLPICA_BASE_URL
+JOLPICA_2026_BASE_URL = Config.JOLPICA_2026_BASE_URL
+OPEN_METEO_BASE_URL = Config.OPEN_METEO_BASE_URL
