@@ -654,7 +654,13 @@ class LapTimeLeaderboardComponent(BaseComponent):
                         self.selected = [code]
 
                 window.selected_drivers = self.selected
-                window.selected_driver = self.selected[-1] if self.selected else None
+                # In qualifying replay, once a primary telemetry lap is loaded,
+                # Shift+Click should only add/remove comparison drivers and must
+                # not reopen the segment selector modal.
+                if is_multi and getattr(window, "loaded_driver_code", None):
+                    window.selected_driver = None
+                else:
+                    window.selected_driver = self.selected[-1] if self.selected else None
                 return True
         return False
 

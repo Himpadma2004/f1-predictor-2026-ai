@@ -57,6 +57,9 @@ class F1RaceReplayWindow(arcade.Window):
         self.driver_colors = driver_colors or {}
         self.frame_index = 0.0  # use float for fractional-frame accumulation
         self.paused = False
+        self.selected_drivers = []
+        self.corner_metric_modes = ["minimum", "entry", "apex", "exit"]
+        self.corner_metric_mode_index = 0
         self.total_laps = total_laps
         self.has_weather = any("weather" in frame for frame in frames) if frames else False
         self.visible_hud = visible_hud # If it displays HUD or not (leaderboard, controls, weather, etc)
@@ -79,8 +82,22 @@ class F1RaceReplayWindow(arcade.Window):
         self.driver_info_comp = DriverInfoComponent(left=20, width=300)
         self.controls_popup_comp = ControlsPopupComponent()
 
-        self.controls_popup_comp.set_size(340, 250) # width/height of the popup box
+        self.controls_popup_comp.set_size(340, 280) # width/height of the popup box
         self.controls_popup_comp.set_font_sizes(header_font_size=16, body_font_size=13) # adjust font sizes
+        self.controls_popup_comp.set_lines([
+            ("SPACE", "Pause/Resume"),
+            ("← / →", "Jump back/forward"),
+            ("↑ / ↓", "Speed +/-"),
+            ("1-4", "Set speed: 0.5x / 1x / 2x / 4x"),
+            ("R", "Restart"),
+            ("D", "Toggle DRS Zones"),
+            ("B", "Toggle Progress Bar"),
+            ("L", "Toggle Driver Labels"),
+            ("T", "Toggle Corner Metric"),
+            ("H", "Toggle Help Popup"),
+            ("Drag ⋮⋮", "Move panels freely on screen"),
+            ("Y", "Reset all panel positions"),
+        ])
         self.degradation_integrator = None
         if session is not None:
             try:
@@ -184,6 +201,7 @@ class F1RaceReplayWindow(arcade.Window):
         self._ref_seg_len = diffs
         self._ref_cumdist = np.concatenate(([0.0], np.cumsum(diffs)))
         self._ref_total_length = float(self._ref_cumdist[-1]) if len(self._ref_cumdist) > 0 else 0.0
+        self.corner_markers = self._detect_track_corners()
 
         # Pre-calculate interpolated world points ONCE (optimization)
         self.world_inner_points = self._interpolate_points(self.x_inner, self.y_inner)
@@ -211,6 +229,19 @@ class F1RaceReplayWindow(arcade.Window):
 
         # Trigger initial scaling calculation
         self.update_scaling(self.width, self.height)
+
+        # Draggable Panel System
+        # Track positions of movable panels (offset from default, in pixels)
+        self.panel_positions = {
+            "comparison": {"offset_x": 0, "offset_y": 0},  # Multi-driver comparison table
+            "heatmap": {"offset_x": 0, "offset_y": 0}      # Corner split heatmap
+        }
+        self.dragging_panel = None
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        self.drag_start_panel_x = 0
+        self.drag_start_panel_y = 0
+        self.load_panel_positions()
 
         # Selection & hit-testing state for leaderboard
         self.selected_driver = None
@@ -278,6 +309,32 @@ class F1RaceReplayWindow(arcade.Window):
                 "total_laps": self.total_laps
             }
         })
+
+    def load_panel_positions(self):
+        """Load panel positions from config file."""
+        import json
+        import os
+        config_path = "panel_positions.json"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    saved_positions = json.load(f)
+                    if isinstance(saved_positions, dict):
+                        self.panel_positions.update(saved_positions)
+                        print(f"✓ Loaded panel positions from {config_path}")
+            except Exception as e:
+                print(f"Failed to load panel positions: {e}")
+
+    def save_panel_positions(self):
+        """Save current panel positions to config file."""
+        import json
+        config_path = "panel_positions.json"
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(self.panel_positions, f, indent=2)
+                print(f"✓ Saved panel positions to {config_path}")
+        except Exception as e:
+            print(f"Failed to save panel positions: {e}")
 
     def _interpolate_points(self, xs, ys, interp_points=2000):
         t_old = np.linspace(0, 1, len(xs))
@@ -684,6 +741,8 @@ class F1RaceReplayWindow(arcade.Window):
         
         # Selected driver info component
         self.driver_info_comp.draw(self)
+        self._draw_multi_driver_comparison_panel(frame)
+        self._draw_corner_split_panel(frame)
         
         # Race Progress Bar with event markers (DNF, flags, leader changes)
         self.progress_bar_comp.draw(self)
@@ -699,6 +758,309 @@ class F1RaceReplayWindow(arcade.Window):
         
         # Draw tooltips and overlays on top of everything
         self.progress_bar_comp.draw_overlays(self)
+
+    def _detect_track_corners(self) -> list[dict[str, float | int]]:
+        """Detect turn apexes from reference track curvature."""
+        if len(self._ref_xs) < 30:
+            return []
+
+        step = 6
+        min_sep = 80
+        curvatures: list[float] = [0.0] * len(self._ref_xs)
+
+        for i in range(step, len(self._ref_xs) - step):
+            x0, y0 = self._ref_xs[i - step], self._ref_ys[i - step]
+            x1, y1 = self._ref_xs[i], self._ref_ys[i]
+            x2, y2 = self._ref_xs[i + step], self._ref_ys[i + step]
+
+            v1 = np.array([x1 - x0, y1 - y0], dtype=float)
+            v2 = np.array([x2 - x1, y2 - y1], dtype=float)
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 <= 1e-6 or n2 <= 1e-6:
+                continue
+            cosang = float(np.dot(v1, v2) / (n1 * n2))
+            cosang = max(-1.0, min(1.0, cosang))
+            curvatures[i] = abs(np.arccos(cosang))
+
+        curv_arr = np.array(curvatures)
+        non_zero = curv_arr[curv_arr > 0]
+        if non_zero.size == 0:
+            return []
+        threshold = float(np.percentile(non_zero, 82))
+
+        candidate_idx = [i for i, c in enumerate(curvatures) if c >= threshold]
+        candidate_idx.sort(key=lambda i: curvatures[i], reverse=True)
+
+        selected: list[int] = []
+        for idx in candidate_idx:
+            if all(min(abs(idx - s), len(self._ref_xs) - abs(idx - s)) >= min_sep for s in selected):
+                selected.append(idx)
+
+        selected.sort()
+        corners: list[dict[str, float | int]] = []
+        for n, idx in enumerate(selected, start=1):
+            apex_rel = float(self._ref_cumdist[idx] / self._ref_total_length) if self._ref_total_length > 0 else 0.0
+            corners.append({"turn": n, "idx": idx, "apex_rel": apex_rel})
+        return corners
+
+    @staticmethod
+    def _rel_in_window(rel: float, center: float, half: float) -> bool:
+        low = center - half
+        high = center + half
+        if low < 0:
+            return rel >= (1.0 + low) or rel <= high
+        if high > 1:
+            return rel >= low or rel <= (high - 1.0)
+        return low <= rel <= high
+
+    def _corner_metric_from_lap_samples(self, samples: list[tuple[float, float]], apex_rel: float) -> float | None:
+        mode = self.corner_metric_modes[self.corner_metric_mode_index]
+        if not samples:
+            return None
+
+        def _circular_delta(a: float, b: float) -> float:
+            d = abs(a - b)
+            return min(d, 1.0 - d)
+
+        if mode == "minimum":
+            candidates = [spd for rel, spd in samples if self._rel_in_window(rel, apex_rel, 0.018)]
+            return min(candidates) if candidates else None
+
+        if mode == "apex":
+            best = min(samples, key=lambda rs: _circular_delta(rs[0], apex_rel))
+            return best[1]
+
+        if mode == "entry":
+            center = (apex_rel - 0.025) % 1.0
+            candidates = [spd for rel, spd in samples if self._rel_in_window(rel, center, 0.010)]
+            return float(np.mean(candidates)) if candidates else None
+
+        center = (apex_rel + 0.025) % 1.0
+        candidates = [spd for rel, spd in samples if self._rel_in_window(rel, center, 0.010)]
+        return float(np.mean(candidates)) if candidates else None
+
+    def _build_driver_lap_samples(self, driver_code: str, current_lap: int) -> list[tuple[float, float]]:
+        """Collect (rel_dist, speed) samples for the driver's current lap up to current frame."""
+        idx_now = min(int(self.frame_index), self.n_frames - 1)
+        out: list[tuple[float, float]] = []
+        for fr in self.frames[:idx_now + 1]:
+            drv = fr.get("drivers", {}).get(driver_code)
+            if not drv:
+                continue
+            lap = int(drv.get("lap", 0) or 0)
+            if lap != current_lap:
+                continue
+            rel = drv.get("rel_dist")
+            spd = drv.get("speed")
+            if rel is None or spd is None:
+                continue
+            rel_f = float(rel)
+            if rel_f > 1.0:
+                rel_f = rel_f / 100.0 if rel_f <= 100.0 else rel_f % 1.0
+            out.append((rel_f, float(spd)))
+        return out
+
+    def _draw_corner_split_panel(self, frame: dict) -> None:
+        """Draw true per-corner split view for selected race drivers."""
+        if not self.corner_markers or not frame or "drivers" not in frame:
+            return
+
+        selected = list(getattr(self, "selected_drivers", []) or [])
+        if not selected and getattr(self, "selected_driver", None):
+            selected = [self.selected_driver]
+        if len(selected) < 2:
+            return
+
+        sample_map: dict[str, list[tuple[float, float]]] = {}
+        color_map: dict[str, tuple[int, int, int]] = {}
+        for code in selected[:5]:
+            drv = frame["drivers"].get(code)
+            if not drv:
+                continue
+            current_lap = int(drv.get("lap", 0) or 0)
+            samples = self._build_driver_lap_samples(code, current_lap)
+            if len(samples) < 10:
+                continue
+            sample_map[code] = samples
+            color_map[code] = tuple(self.driver_colors.get(code, arcade.color.WHITE))
+
+        if len(sample_map) < 2:
+            return
+
+        shown_corners = self.corner_markers[:9]
+        codes = list(sample_map.keys())
+        panel_w = 450
+        row_h = 20
+        header_h = 56
+        panel_h = header_h + row_h * len(shown_corners)
+        right_safe = self.width - self.right_ui_margin - 14
+        left = max(self.left_ui_margin + 20, right_safe - panel_w)
+
+        compare_rows = max(2, min(6, len(selected)))
+        compare_h = 36 + 24 * (compare_rows + 1)
+        top = self.height - 110 - compare_h
+        min_top = panel_h + 95
+        top = max(min_top, min(top, self.height - 120))
+
+        # Apply stored offset
+        offset = self.panel_positions.get("heatmap", {})
+        left += offset.get("offset_x", 0)
+        top += offset.get("offset_y", 0)
+
+        cx = left + panel_w / 2
+        cy = top - panel_h / 2
+
+        # Store panel bounds for mouse hit detection
+        self.heatmap_panel_bounds = {"left": left, "top": top, "width": panel_w, "height": panel_h}
+
+        panel_rect = arcade.XYWH(cx, cy, panel_w, panel_h)
+        arcade.draw_rect_filled(panel_rect, (10, 10, 10, 220))
+        arcade.draw_rect_outline(panel_rect, arcade.color.GRAY, 1)
+
+        # Draw draggable handle on header
+        handle_rect = arcade.XYWH(left + 5, top - 20, 20, 15)
+        arcade.draw_rect_filled(handle_rect, (80, 80, 80, 200))
+        arcade.draw_rect_outline(handle_rect, (120, 120, 120), 1)
+        arcade.Text("⋮⋮", left + 8, top - 12, arcade.color.LIGHT_GRAY, 8).draw()
+
+        mode = self.corner_metric_modes[self.corner_metric_mode_index].upper()
+        arcade.Text(f"Per-Corner Split Heatmap ({mode} speed)", left + 10, top - 10, arcade.color.ANTI_FLASH_WHITE, 12, bold=True).draw()
+        arcade.Text("Press T to switch metric", left + 10, top - 28, arcade.color.LIGHT_GRAY, 10).draw()
+
+        heat_left = left + 72
+        heat_w = panel_w - 80
+        col_w = heat_w / max(1, len(codes))
+
+        for idx, code in enumerate(codes):
+            cxh = heat_left + idx * col_w + col_w / 2
+            arcade.Text(code, cxh, top - 44, color_map.get(code, arcade.color.WHITE), 9, anchor_x="center").draw()
+
+        y = top - 64
+        for corner in shown_corners:
+            turn = int(corner["turn"])
+            apex_rel = float(corner["apex_rel"])
+
+            vals: dict[str, float] = {}
+            for code, samples in sample_map.items():
+                v = self._corner_metric_from_lap_samples(samples, apex_rel)
+                if v is not None:
+                    vals[code] = v
+
+            arcade.Text(f"T{turn:>2}", left + 10, y, arcade.color.ANTI_FLASH_WHITE, 10).draw()
+
+            baseline_code = selected[0] if selected and selected[0] in vals else (codes[0] if codes and codes[0] in vals else None)
+            baseline = vals.get(baseline_code) if baseline_code else None
+            best = max(vals.values()) if vals else None
+
+            for idx, code in enumerate(codes):
+                cxh = heat_left + idx * col_w + col_w / 2
+                val = vals.get(code)
+                if val is None:
+                    arcade.draw_rect_filled(arcade.XYWH(cxh, y + 2, col_w - 4, row_h - 6), (50, 50, 50, 180))
+                    continue
+
+                if baseline is not None:
+                    delta = val - baseline
+                elif best is not None:
+                    delta = val - best
+                else:
+                    delta = 0.0
+
+                norm = max(-1.0, min(1.0, delta / 12.0))
+                if norm >= 0:
+                    color = (int(40 + 160 * norm), int(80 + 160 * norm), 50, 220)
+                else:
+                    n = abs(norm)
+                    color = (int(80 + 170 * n), int(40 + 70 * (1 - n)), int(40 + 50 * (1 - n)), 220)
+
+                arcade.draw_rect_filled(arcade.XYWH(cxh, y + 2, col_w - 4, row_h - 6), color)
+                arcade.Text(f"{val:.0f}", cxh, y + 1, arcade.color.WHITE, 9, anchor_x="center").draw()
+            y -= row_h
+
+    def _draw_multi_driver_comparison_panel(self, frame: dict) -> None:
+        """Draw side-by-side race telemetry comparison for selected drivers."""
+        selected = list(getattr(self, "selected_drivers", []) or [])
+        if not selected and getattr(self, "selected_driver", None):
+            selected = [self.selected_driver]
+
+        if len(selected) < 2 or not frame or "drivers" not in frame:
+            return
+
+        rows = []
+        for code in selected[:6]:
+            pos = frame["drivers"].get(code)
+            if not pos:
+                continue
+
+            speed = float(pos.get("speed", 0.0) or 0.0)
+            gear = int(pos.get("gear", 0) or 0)
+            throttle = float(pos.get("throttle", 0.0) or 0.0)
+            brake = float(pos.get("brake", 0.0) or 0.0)
+            progress = self._project_to_reference(pos.get("x", 0.0), pos.get("y", 0.0))
+            color = tuple(self.driver_colors.get(code, arcade.color.WHITE))
+
+            rows.append({
+                "code": code,
+                "speed": speed,
+                "gear": gear,
+                "throttle": throttle,
+                "brake": brake,
+                "progress": progress,
+                "color": color,
+            })
+
+        if len(rows) < 2:
+            return
+
+        rows.sort(key=lambda x: x["speed"], reverse=True)
+        fastest = rows[0]["speed"]
+
+        panel_w = 440
+        row_h = 24
+        panel_h = 36 + row_h * (len(rows) + 1)
+        right_safe = self.width - self.right_ui_margin - 14
+        left = max(self.left_ui_margin + 20, right_safe - panel_w)
+        top = min(self.height - 120, max(panel_h + 70, self.height - 260))
+
+        # Apply stored offset
+        offset = self.panel_positions.get("comparison", {})
+        left += offset.get("offset_x", 0)
+        top += offset.get("offset_y", 0)
+
+        cx = left + panel_w / 2
+        cy = top - panel_h / 2
+
+        # Store panel bounds for mouse hit detection
+        self.comparison_panel_bounds = {"left": left, "top": top, "width": panel_w, "height": panel_h}
+
+        panel_rect = arcade.XYWH(cx, cy, panel_w, panel_h)
+        arcade.draw_rect_filled(panel_rect, (10, 10, 10, 220))
+        arcade.draw_rect_outline(panel_rect, arcade.color.GRAY, 1)
+
+        # Draw draggable handle on header
+        handle_rect = arcade.XYWH(left + 5, top - 20, 20, 15)
+        arcade.draw_rect_filled(handle_rect, (80, 80, 80, 200))
+        arcade.draw_rect_outline(handle_rect, (120, 120, 120), 1)
+        arcade.Text("⋮⋮", left + 8, top - 12, arcade.color.LIGHT_GRAY, 8).draw()
+
+        arcade.Text("Race Multi-Driver Compare (Shift+Click leaderboard)", left + 10, top - 10, arcade.color.ANTI_FLASH_WHITE, 12, bold=True).draw()
+        arcade.Text("DRV   SPEED   ΔFAST   GEAR   THR   BRK   TRACK m", left + 10, top - 32, arcade.color.LIGHT_GRAY, 10).draw()
+
+        y = top - 54
+        for row in rows:
+            delta = row["speed"] - fastest
+            line = (
+                f"{row['code']:>3}   "
+                f"{row['speed']:>5.0f}   "
+                f"{delta:+6.1f}   "
+                f"{row['gear']:>4}   "
+                f"{row['throttle']:>3.0f}%   "
+                f"{row['brake']:>3.0f}%   "
+                f"{row['progress']:>6.0f}"
+            )
+            arcade.Text(line, left + 10, y, row["color"], 10).draw()
+            y -= row_h
                     
     def on_update(self, delta_time: float):
         self.race_controls_comp.on_update(delta_time)
@@ -799,6 +1161,16 @@ class F1RaceReplayWindow(arcade.Window):
             self.progress_bar_comp.toggle_visibility() # toggle progress bar visibility
         elif symbol == arcade.key.I:
             self.session_info_comp.toggle_visibility() # toggle session info banner
+        elif symbol == arcade.key.T:
+            self.corner_metric_mode_index = (self.corner_metric_mode_index + 1) % len(self.corner_metric_modes)
+        elif symbol == arcade.key.Y:
+            # Reset all panel positions to default
+            self.panel_positions = {
+                "comparison": {"offset_x": 0, "offset_y": 0},
+                "heatmap": {"offset_x": 0, "offset_y": 0}
+            }
+            self.save_panel_positions()
+            print("✓ Panel positions reset to default")
 
     def on_key_release(self, symbol: int, modifiers: int):
         if symbol == arcade.key.RIGHT:
@@ -813,8 +1185,37 @@ class F1RaceReplayWindow(arcade.Window):
             self.is_forwarding = False
             self.is_rewinding = False
             self.paused = self.was_paused_before_hold
+        
+        # End panel dragging
+        if self.dragging_panel:
+            self.save_panel_positions()
+            self.dragging_panel = None
 
     def on_mouse_press(self, x: float, y: float, button: int, modifiers: int):
+        # Check if clicking on a draggable panel handle
+        if hasattr(self, 'heatmap_panel_bounds') and self.heatmap_panel_bounds:
+            bounds = self.heatmap_panel_bounds
+            handle_area = arcade.XYWH(bounds["left"] + 5, bounds["top"] - 20, 20, 15)
+            if (bounds["left"] + 5 <= x <= bounds["left"] + 25 and
+                bounds["top"] - 20 <= y <= bounds["top"]):
+                self.dragging_panel = "heatmap"
+                self.drag_start_x = x
+                self.drag_start_y = y
+                self.drag_start_panel_x = self.panel_positions["heatmap"]["offset_x"]
+                self.drag_start_panel_y = self.panel_positions["heatmap"]["offset_y"]
+                return
+
+        if hasattr(self, 'comparison_panel_bounds') and self.comparison_panel_bounds:
+            bounds = self.comparison_panel_bounds
+            if (bounds["left"] + 5 <= x <= bounds["left"] + 25 and
+                bounds["top"] - 20 <= y <= bounds["top"]):
+                self.dragging_panel = "comparison"
+                self.drag_start_x = x
+                self.drag_start_y = y
+                self.drag_start_panel_x = self.panel_positions["comparison"]["offset_x"]
+                self.drag_start_panel_y = self.panel_positions["comparison"]["offset_y"]
+                return
+
         # forward to components; stop at first that handled it
         if self.controls_popup_comp.on_mouse_press(self, x, y, button, modifiers):
             return
@@ -830,12 +1231,27 @@ class F1RaceReplayWindow(arcade.Window):
         self.selected_driver = None
         
     def on_mouse_motion(self, x: float, y: float, dx: float, dy: float):
-        """Handle mouse motion for hover effects on progress bar and controls."""
+        """Handle mouse motion for hover effects and panel dragging."""
+        # Update panel position if dragging
+        if self.dragging_panel:
+            delta_x = x - self.drag_start_x
+            delta_y = y - self.drag_start_y
+            
+            new_offset_x = self.drag_start_panel_x + delta_x
+            new_offset_y = self.drag_start_panel_y + delta_y
+            
+            self.panel_positions[self.dragging_panel]["offset_x"] = new_offset_x
+            self.panel_positions[self.dragging_panel]["offset_y"] = new_offset_y
+            return
+
         self.progress_bar_comp.on_mouse_motion(self, x, y, dx, dy)
         self.race_controls_comp.on_mouse_motion(self, x, y, dx, dy)
         
     def close(self):
         """Clean up resources when window closes."""
+        # Save panel positions before closing
+        self.save_panel_positions()
+        
         if hasattr(self, 'telemetry_stream') and self.telemetry_stream:
             print("Stopping telemetry stream server...")
             self.telemetry_stream.stop()

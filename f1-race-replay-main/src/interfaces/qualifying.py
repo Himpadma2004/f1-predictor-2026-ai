@@ -2,6 +2,7 @@ import arcade
 import threading
 import time
 import numpy as np
+from typing import Any
 from src.ui_components import (
     build_track_from_example_lap,
     LapTimeLeaderboardComponent,
@@ -83,6 +84,9 @@ class QualifyingReplay(arcade.Window):
 
         self.chart_active = False
         self.show_comparison_telemetry = True
+        self.selected_drivers = []
+        self.corner_metric_modes = ["minimum", "entry", "apex", "exit"]
+        self.corner_metric_mode_index = 0
 
         self.loaded_driver_code = None
         self.loaded_driver_segment = None
@@ -94,13 +98,17 @@ class QualifyingReplay(arcade.Window):
             ("← / →", "Jump back/forward"),
             ("↑ / ↓", "Speed +/-"),
             ("1-4", "Set speed: 0.5x / 1x / 2x / 4x"),
+            ("SHIFT+Click", "Select multiple drivers"),
             ("R", "Restart"),
             ("D", "Toggle DRS Zones"),
             ("C", "Toggle Comparison Telemetry"),
+            ("T", "Toggle Corner Metric"),
             ("H", "Toggle Help Popup"),
+            ("Drag ⋮⋮", "Move panels freely on screen"),
+            ("Y", "Reset all panel positions"),
             ("ESC", "Close Window"),
         ])
-        self.controls_popup_comp.set_size(340, 250)
+        self.controls_popup_comp.set_size(340, 280)
         self.controls_popup_comp.set_font_sizes(header_font_size=16, body_font_size=13)
 
         # Build the track layout from an example lap
@@ -136,6 +144,7 @@ class QualifyingReplay(arcade.Window):
         self._ref_seg_len = diffs
         self._ref_cumdist = np.concatenate(([0.0], np.cumsum(diffs)))
         self._ref_total_length = float(self._ref_cumdist[-1]) if len(self._ref_cumdist) > 0 else 0.0
+        self.corner_markers = self._detect_track_corners()
 
         # Pre-calculate interpolated world points ONCE (optimization)
         self.world_inner_points = self._interpolate_points(self.x_inner, self.y_inner)
@@ -156,6 +165,19 @@ class QualifyingReplay(arcade.Window):
         self.is_rewinding = False
         self.is_forwarding = False
         self.was_paused_before_hold = False
+
+        # Draggable Panel System
+        # Track positions of movable panels (offset from default, in pixels)
+        self.panel_positions = {
+            "overlay_charts": {"offset_x": 0, "offset_y": 0},  # Multi-driver overlay charts
+            "heatmap": {"offset_x": 0, "offset_y": 0}           # Corner split heatmap
+        }
+        self.dragging_panel = None
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        self.drag_start_panel_x = 0
+        self.drag_start_panel_y = 0
+        self.load_panel_positions()
 
     def update_scaling(self, screen_w, screen_h):
         """
@@ -224,9 +246,11 @@ class QualifyingReplay(arcade.Window):
             frames = self.loaded_telemetry.get("frames") if isinstance(self.loaded_telemetry, dict) else None
             if frames:
                 fastest_driver = self.data.get("results", [])[0] if isinstance(self.data.get("results", []), list) and len(self.data.get("results", [])) > 0 else None
-                # Get comparison telemetry if available
                 comparison_data = self.data.get("telemetry", {}).get(fastest_driver.get("code")) if fastest_driver and self.show_comparison_telemetry else None
-                comparison_telemetry = comparison_data.get("Q3").get("frames", []) if comparison_data and self.show_comparison_telemetry and fastest_driver and ((fastest_driver.get("code") != self.loaded_driver_code) or (fastest_driver.get("code") == self.loaded_driver_code and self.loaded_driver_segment != "Q3")) else None
+
+                active_series = self._build_active_driver_series(fastest_driver)
+                if not active_series:
+                    return
 
                 # right-hand area (to the right of leaderboard)
                 area_left = self.leaderboard.x + getattr(self.leaderboard, "width", 240) + 40
@@ -291,7 +315,7 @@ class QualifyingReplay(arcade.Window):
 
                 # DRS key at right of the speed subtitle (green square + label)
                 key_size = 12
-                key_padding_right = 100
+                key_padding_right = 110
                 # Align vertically with the subtitle (use same y offset, center the square)
                 key_y = speed_top + 10 + (key_size * 0.5)
                 square_x = chart_right - key_padding_right - (key_size / 2)
@@ -306,27 +330,6 @@ class QualifyingReplay(arcade.Window):
                     12,
                     anchor_y="center"
                 ).draw()
-
-                # Comparison driver key (yellow line + label)
-
-                if comparison_telemetry:
-                    comp_key_size = 12
-                    comp_key_padding_right = 350
-                    comp_key_y = speed_top + 10 + (comp_key_size * 0.5)
-                    comp_square_x = chart_right - comp_key_padding_right - (comp_key_size / 2)
-
-                    comp_driver_code = fastest_driver.get("code") if fastest_driver else "N/A"
-
-                    comp_key_rect = arcade.XYWH(comp_square_x, comp_key_y, comp_key_size, 3)
-                    arcade.draw_rect_filled(comp_key_rect, arcade.color.YELLOW)
-                    arcade.Text(
-                        f"Comparison Driver: {comp_driver_code} - Q3",
-                        comp_square_x + (comp_key_size * 0.5) + 6,
-                        comp_key_y,
-                        arcade.color.ANTI_FLASH_WHITE,
-                        12,
-                        anchor_y="center"
-                    ).draw()
 
                 # compute global ranges from all frames (use distance for x-axis) - Should be max of 1.0 rel_dist, but just in case
 
@@ -348,17 +351,6 @@ class QualifyingReplay(arcade.Window):
 
                 # Prepare arrays for drawing up to current frame index (animate)
                 self.frame_index = max(0, min(self.frame_index, len(frames) - 1))
-                draw_pos = []         # along-track distance used as x-axis
-                draw_speeds = []
-                draw_throttle = []
-                draw_brake = []
-                draw_gears = []
-                
-                draw_comparison_pos = []
-                draw_comparison_speeds = []
-                draw_comparison_throttle = []
-                draw_comparison_brake = []
-                draw_comparison_gears = []
                 # The speed chart background will have sections of it shaded green to indicate where DRS was active
 
                 # find the drs zones for this lap that the driver has already passed.
@@ -368,7 +360,6 @@ class QualifyingReplay(arcade.Window):
 
                 current_frame = frames[self.frame_index]
                 current_tel = current_frame.get("telemetry", {}) if isinstance(current_frame.get("telemetry", {}), dict) else {}
-                current_comparison_tel = comparison_telemetry[self.frame_index].get("telemetry") if comparison_telemetry and self.frame_index < len(comparison_telemetry) else {}
                 current_dist = self._pick_telemetry_value(current_tel, "dist")
                 
                 for dz in self.drs_zones:
@@ -410,152 +401,25 @@ class QualifyingReplay(arcade.Window):
                     drs_rect = arcade.XYWH((x1pix + x2pix) * 0.5, speed_bottom + speed_h * 0.5, x2pix - x1pix, speed_h)
                     arcade.draw_rect_filled(drs_rect, (0, 100, 0, 100)) # semi-transparent green
 
-                # Collect values frame-by-frame (safe for mixed datasets)
-                for f_i, f in enumerate(frames[:self.frame_index + 1]):
-                    tel = f.get("telemetry", {}) if isinstance(f.get("telemetry", {}), dict) else {}
-                    d = self._pick_telemetry_value(tel, "rel_dist")
-                    s = self._pick_telemetry_value(tel, "speed")
-                    if d is None or s is None:
-                        continue
-                    # throttle
-                    th = self._pick_telemetry_value(tel, "throttle")
-                    # brake
-                    br = self._pick_telemetry_value(tel, "brake")
-                    # gear
-                    gr = self._pick_telemetry_value(tel, "gear")
-
-                    draw_pos.append(float(d))
-                    draw_speeds.append(float(s))
-                    draw_throttle.append(float(th) if th is not None else None)
-                    if isinstance(br, (bool, int)):
-                        draw_brake.append(1.0 if br else 0.0)
-                    else:
-                        draw_brake.append(float(br) if br is not None else None)
-                    draw_gears.append(int(gr) if gr is not None else None)
-
-                    # Comparison Driver telemetry
-
-                    if comparison_telemetry and f_i < len(comparison_telemetry):
-
-                        frame_comparison_telemetry = comparison_telemetry[f_i]
-
-                        if frame_comparison_telemetry is not None:
-                            frame_comparison_telemetry = frame_comparison_telemetry.get("telemetry", {}) if isinstance(frame_comparison_telemetry.get("telemetry", {}), dict) else {}
-                            c_d = self._pick_telemetry_value(frame_comparison_telemetry, "rel_dist")
-                            c_s= self._pick_telemetry_value(frame_comparison_telemetry, "speed")
-                            c_th = self._pick_telemetry_value(frame_comparison_telemetry, "throttle")
-                            c_br = self._pick_telemetry_value(frame_comparison_telemetry, "brake")
-                            c_gr = self._pick_telemetry_value(frame_comparison_telemetry, "gear")
-                            draw_comparison_pos.append(float(c_d) if c_d is not None else None)
-                            draw_comparison_speeds.append(float(c_s) if c_s is not None else None)
-                            draw_comparison_throttle.append(float(c_th) if c_th is not None else None)
-                            if isinstance(c_br, (bool, int)):
-                                draw_comparison_brake.append(1.0 if c_br else 0.0)
-                            else:
-                                draw_comparison_brake.append(float(c_br) if c_br is not None else None)
-                            draw_comparison_gears.append(int(c_gr) if c_gr is not None else None)
-
-                if draw_comparison_pos and draw_comparison_speeds:
-                    pts = []
-                    for d, s in zip(draw_comparison_pos, draw_comparison_speeds):
-                        if s is None:
-                            continue
-                        nx = (d - full_d_min) / (full_d_max - full_d_min)
-                        ny = (s - full_s_min) / (full_s_max - full_s_min)
-                        xpix = chart_left + nx * chart_w
-                        ypix = speed_bottom + VP + ny * (speed_h - 2 * VP)
-                        pts.append((xpix, ypix))
-                    try:
-                        arcade.draw_line_strip(pts, arcade.color.YELLOW, 2)
-                        # Show current speed in km/h
-                        current_speed = draw_comparison_speeds[-1] if draw_comparison_speeds else 0
-                        arcade.Text(f"{current_speed:.0f} km/h", pts[-1][0] + 10, pts[-1][1] - 15, arcade.color.YELLOW, 12).draw()
-                    except Exception as e:
-                        print("Chart draw error (comparison speed):", e)
-
-                # Draw speed in the top sub-area (x-axis = distance)
-                if draw_pos and draw_speeds:
-                    pts = []
-                    for d, s in zip(draw_pos, draw_speeds):
-                        nx = (d - full_d_min) / (full_d_max - full_d_min)
-                        ny = (s - full_s_min) / (full_s_max - full_s_min)
-                        xpix = chart_left + nx * chart_w
-                        ypix = speed_bottom + VP + ny * (speed_h - 2 * VP)
-                        pts.append((xpix, ypix))
-                    try:
-                        arcade.draw_line_strip(pts, arcade.color.ANTI_FLASH_WHITE, 2)
-                        # Show current speed in km/h
-                        current_speed = draw_speeds[-1] if draw_speeds else 0
-                        arcade.Text(f"{current_speed:.0f} km/h", pts[-1][0] + 10, pts[-1][1] + 5, arcade.color.ANTI_FLASH_WHITE, 12).draw()
-                    except Exception as e:
-                        print("Chart draw error (speed):", e)
-
-                # Draw gears in the middle sub-area
-                gear_pts = []
-                comparison_gear_pts = []
-                for d, g in zip(draw_pos, draw_gears):
-                    if g is None:
-                        continue
-                    nx = (d - full_d_min) / (full_d_max - full_d_min)
-                    xpix = chart_left + nx * chart_w
-                    # map gear to vertical within gear box (higher gears near top of gear area)
-                    gy = (g - self.g_min) / (self.g_max - self.g_min)
-                    ypix = gear_bottom + VP + gy * (gear_h - 2 * VP)
-                    gear_pts.append((xpix, ypix))
-
-                # Add comparison driver's gears
-                for d, g in zip(draw_comparison_pos, draw_comparison_gears):
-                    if g is None:
-                        continue
-                    nx = (d - full_d_min) / (full_d_max - full_d_min)
-                    xpix = chart_left + nx * chart_w
-                    gy = (g - self.g_min) / (self.g_max - self.g_min)
-                    ypix = gear_bottom + VP + gy * (gear_h - 2 * VP)
-                    comparison_gear_pts.append((xpix, ypix))
-
-                try:
-                    if comparison_gear_pts:
-                        arcade.draw_line_strip(comparison_gear_pts, arcade.color.YELLOW, 2)
-                        
-                    if gear_pts:
-                        arcade.draw_line_strip(gear_pts, arcade.color.LIGHT_GRAY, 2)
-                        
-                        # Show current gear next to the line
-
-                        current_gear = draw_gears[-1] if draw_gears else 0
-                        arcade.Text(f"Gear: {int(current_gear)}", gear_pts[-1][0] + 10, gear_pts[-1][1] + 5, arcade.color.LIGHT_GRAY, 12).draw()
-                        
-                except Exception as e:
-                    print("Chart draw error (gear):", e)
-
-
-                th_min = self.th_min
-                th_max = self.th_max
-
-                br_min = self.br_min
-                br_max = self.br_max
-
-                throttle_pts = []
-                brake_pts = []
-                for d, th, br in zip(draw_pos, draw_throttle, draw_brake):
-                    nx = (d - full_d_min) / (full_d_max - full_d_min)
-                    xpix = chart_left + nx * chart_w
-                    if th is not None:
-                        ny = (th - th_min) / (th_max - th_min)
-                        ypix = ctrl_bottom + VP + ny * (ctrl_h - 2 * VP)
-                        throttle_pts.append((xpix, ypix))
-                    if br is not None:
-                        ny = (br - br_min) / (br_max - br_min)
-                        ypix = ctrl_bottom + VP + ny * (ctrl_h - 2 * VP)
-                        brake_pts.append((xpix, ypix))
-
-                try:
-                    if throttle_pts:
-                        arcade.draw_line_strip(throttle_pts, arcade.color.GREEN, 2)
-                    if brake_pts:
-                        arcade.draw_line_strip(brake_pts, arcade.color.RED, 2)
-                except Exception as e:
-                    print("Chart draw error (controls):", e)
+                # Draw multi-driver overlays (speed/gear/throttle/brake) in shared charts.
+                self._draw_multi_driver_overlay_charts(
+                    active_series=active_series,
+                    chart_left=chart_left,
+                    chart_w=chart_w,
+                    speed_bottom=speed_bottom,
+                    speed_h=speed_h,
+                    gear_bottom=gear_bottom,
+                    gear_h=gear_h,
+                    ctrl_bottom=ctrl_bottom,
+                    ctrl_h=ctrl_h,
+                    vp=VP,
+                    full_d_min=full_d_min,
+                    full_d_max=full_d_max,
+                    full_s_min=full_s_min,
+                    full_s_max=full_s_max,
+                    chart_right=chart_right,
+                    speed_top=speed_top,
+                )
                 
                 # Draw qualifying lap time component at top of map area
                 self.qualifying_lap_time_comp.x = map_left
@@ -563,6 +427,10 @@ class QualifyingReplay(arcade.Window):
                 self.qualifying_lap_time_comp.fastest_driver = fastest_driver
                 self.qualifying_lap_time_comp.fastest_driver_sector_times = comparison_data.get("Q3").get("sector_times", {}) if comparison_data and self.show_comparison_telemetry and fastest_driver and ((fastest_driver.get("code") != self.loaded_driver_code) or (fastest_driver.get("code") == self.loaded_driver_code and self.loaded_driver_segment != "Q3")) else None
                 self.qualifying_lap_time_comp.draw(self)
+
+                side_panel_x = max(map_left + 280, map_right - 450)
+                self._draw_multi_driver_comparison_panel(side_panel_x, map_top - 5)
+                self._draw_corner_split_panel(side_panel_x, map_top - 210)
 
                 y_offset = map_top - 48
                 arcade.Text(f"Playback Speed: {self.playback_speed:.1f}x", map_left + 10, y_offset - 130, arcade.color.ANTI_FLASH_WHITE, 14).draw()
@@ -618,15 +486,22 @@ class QualifyingReplay(arcade.Window):
                     except Exception as e:
                         print("Circuit draw error:", e)
 
-                    # Draw the comparison driver's position (if available - doing this first so that the current driver is on top visually)
-
-                    if comparison_telemetry and self.frame_index < len(comparison_telemetry):
-                        comp_frame = comparison_telemetry[self.frame_index]
+                    # Draw additional compared drivers on track first so primary stays on top.
+                    for comp in active_series[1:]:
+                        comp_frames = comp.get("frames", [])
+                        if not comp_frames:
+                            continue
+                        c_idx = min(self.frame_index, len(comp_frames) - 1)
+                        comp_frame = comp_frames[c_idx]
                         comp_tel = comp_frame.get("telemetry", {}) if isinstance(comp_frame.get("telemetry", {}), dict) else {}
                         c_px = comp_tel.get("x")
                         c_py = comp_tel.get("y")
+                        if c_px is None or c_py is None:
+                            continue
                         c_sx, c_sy = world_to_map(c_px, c_py)
-                        arcade.draw_circle_filled(c_sx, c_sy, 6, arcade.color.YELLOW)
+                        comp_color = tuple(comp.get("color", arcade.color.YELLOW))
+                        arcade.draw_circle_filled(c_sx, c_sy, 5, comp_color)
+                        arcade.Text(comp.get("code", ""), c_sx + 8, c_sy + 3, arcade.color.WHITE, 10).draw()
 
                     # Draw DRS zones on track map as green highlights
                     if self.drs_zones_xy and self.toggle_drs_zones:
@@ -678,7 +553,7 @@ class QualifyingReplay(arcade.Window):
                     # Overlay current gear near the position marker on the track
                     cur_gear = tel.get("gear") or tel.get("nGear") or tel.get("Gear")
                     if cur_gear is None:
-                        cur_gear = draw_gears[-1] if draw_gears else None
+                        cur_gear = None
                     arcade.Text(self.loaded_driver_code or "", sx + 10, sy + 4, arcade.color.WHITE, 12).draw()
                     if cur_gear is not None:
                         arcade.Text(f"G:{int(cur_gear)}", sx + 10, sy - 10, arcade.color.LIGHT_GRAY, 12).draw()
@@ -708,7 +583,19 @@ class QualifyingReplay(arcade.Window):
         self.controls_popup_comp.draw(self)
 
     def on_mouse_motion(self, x: int, y: int, dx: int, dy: int):
-        """Pass mouse motion events to UI components."""
+        """Pass mouse motion events to UI components and handle panel dragging."""
+        # Update panel position if dragging
+        if self.dragging_panel:
+            delta_x = x - self.drag_start_x
+            delta_y = y - self.drag_start_y
+            
+            new_offset_x = self.drag_start_panel_x + delta_x
+            new_offset_y = self.drag_start_panel_y + delta_y
+            
+            self.panel_positions[self.dragging_panel]["offset_x"] = new_offset_x
+            self.panel_positions[self.dragging_panel]["offset_y"] = new_offset_y
+            return
+
         self.race_controls_comp.on_mouse_motion(self, x, y, dx, dy)
     
     def on_resize(self, width: int, height: int):
@@ -723,6 +610,32 @@ class QualifyingReplay(arcade.Window):
         xs_i = np.interp(t_new, t_old, xs)
         ys_i = np.interp(t_new, t_old, ys)
         return list(zip(xs_i, ys_i))
+
+    def load_panel_positions(self):
+        """Load panel positions from config file."""
+        import json
+        import os
+        config_path = "panel_positions.json"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    saved_positions = json.load(f)
+                    if isinstance(saved_positions, dict):
+                        self.panel_positions.update(saved_positions)
+                        print(f"✓ Loaded panel positions from {config_path}")
+            except Exception as e:
+                print(f"Failed to load panel positions: {e}")
+
+    def save_panel_positions(self):
+        """Save current panel positions to config file."""
+        import json
+        config_path = "panel_positions.json"
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(self.panel_positions, f, indent=2)
+                print(f"✓ Saved panel positions to {config_path}")
+        except Exception as e:
+            print(f"Failed to save panel positions: {e}")
 
     def world_to_screen(self, x, y):
         # Rotate around the track centre (if rotation is set), then scale+translate
@@ -750,7 +663,564 @@ class QualifyingReplay(arcade.Window):
                 return tel[k]
         return None
 
+    def _driver_color(self, code: str) -> tuple[int, int, int]:
+        for r in self.data.get("results", []):
+            if r.get("code") == code and r.get("color"):
+                c = tuple(r.get("color"))
+                return (int(c[0]), int(c[1]), int(c[2]))
+        return (220, 220, 220)
+
+    def _resolve_segment_frames(self, code: str, preferred_segment: str) -> list[dict[str, Any]]:
+        telemetry_store = self.data.get("telemetry") if isinstance(self.data, dict) else None
+        if not isinstance(telemetry_store, dict):
+            return []
+        block = telemetry_store.get(code, {}) if isinstance(telemetry_store.get(code, {}), dict) else {}
+        seg = block.get(preferred_segment) if isinstance(block, dict) else None
+        if isinstance(seg, dict) and seg.get("frames"):
+            return seg.get("frames") or []
+        for fallback in ("Q3", "Q2", "Q1"):
+            cand = block.get(fallback) if isinstance(block, dict) else None
+            if isinstance(cand, dict) and cand.get("frames"):
+                return cand.get("frames") or []
+        return []
+
+    def _build_active_driver_series(self, fastest_driver: dict[str, Any] | None) -> list[dict[str, Any]]:
+        preferred = self.loaded_driver_segment or "Q3"
+        active_codes: list[str] = []
+        if self.loaded_driver_code:
+            active_codes.append(self.loaded_driver_code)
+        for code in self.selected_drivers:
+            if code and code not in active_codes:
+                active_codes.append(code)
+        # Optional auto comparison with fastest driver if only one selected.
+        if self.show_comparison_telemetry and len(active_codes) < 2 and fastest_driver:
+            fast_code = fastest_driver.get("code")
+            if fast_code and fast_code not in active_codes:
+                active_codes.append(fast_code)
+
+        series: list[dict[str, Any]] = []
+        for code in active_codes[:6]:
+            s_frames = self._resolve_segment_frames(code, preferred)
+            if not s_frames:
+                continue
+            series.append({
+                "code": code,
+                "frames": s_frames,
+                "color": self._driver_color(code),
+            })
+        return series
+
+    @staticmethod
+    def _darken_color(color: tuple[int, int, int], amount: int = 90) -> tuple[int, int, int]:
+        return (
+            max(0, color[0] - amount),
+            max(0, color[1] - amount),
+            max(0, color[2] - amount),
+        )
+
+    def _draw_multi_driver_overlay_charts(
+        self,
+        *,
+        active_series: list[dict[str, Any]],
+        chart_left: float,
+        chart_w: float,
+        speed_bottom: float,
+        speed_h: float,
+        gear_bottom: float,
+        gear_h: float,
+        ctrl_bottom: float,
+        ctrl_h: float,
+        vp: float,
+        full_d_min: float,
+        full_d_max: float,
+        full_s_min: float,
+        full_s_max: float,
+        chart_right: float,
+        speed_top: float,
+    ) -> None:
+        """Draw overlays for selected drivers in speed/gear/throttle-brake charts."""
+        def to_x(d: float) -> float:
+            nx = (d - full_d_min) / (full_d_max - full_d_min)
+            return chart_left + nx * chart_w
+
+        legend_entries: list[tuple[str, tuple[int, int, int], float, int, float, float]] = []
+
+        for i, s in enumerate(active_series):
+            code = s["code"]
+            color = tuple(s["color"])
+            frames = s["frames"]
+            idx = min(self.frame_index, len(frames) - 1)
+
+            pos = []
+            speeds = []
+            throttle = []
+            brake = []
+            gears = []
+
+            for f in frames[:idx + 1]:
+                tel = f.get("telemetry", {}) if isinstance(f, dict) else {}
+                d = self._pick_telemetry_value(tel, "rel_dist")
+                spd = self._pick_telemetry_value(tel, "speed")
+                if d is None or spd is None:
+                    continue
+                th = self._pick_telemetry_value(tel, "throttle")
+                br = self._pick_telemetry_value(tel, "brake")
+                gr = self._pick_telemetry_value(tel, "gear", "nGear", "Gear")
+
+                pos.append(float(d))
+                speeds.append(float(spd))
+                throttle.append(float(th) if th is not None else None)
+                if isinstance(br, (bool, int)):
+                    brake.append(1.0 if br else 0.0)
+                else:
+                    brake.append(float(br) if br is not None else None)
+                gears.append(int(gr) if gr is not None else None)
+
+            if not pos:
+                continue
+
+            # Speed
+            speed_pts = []
+            for d, spd in zip(pos, speeds):
+                xpix = to_x(d)
+                ny = (spd - full_s_min) / (full_s_max - full_s_min)
+                ypix = speed_bottom + vp + ny * (speed_h - 2 * vp)
+                speed_pts.append((xpix, ypix))
+            if len(speed_pts) > 1:
+                arcade.draw_line_strip(speed_pts, color, 2)
+                end_x, end_y = speed_pts[-1]
+                y_off = (i - (len(active_series) - 1) / 2.0) * 12
+                arcade.Text(
+                    f"{code} {speeds[-1]:.0f}",
+                    min(chart_right - 72, end_x + 8),
+                    end_y + y_off,
+                    color,
+                    9,
+                    bold=True,
+                ).draw()
+
+            # Gear
+            gear_pts = []
+            for d, g in zip(pos, gears):
+                if g is None:
+                    continue
+                xpix = to_x(d)
+                gy = (g - self.g_min) / (self.g_max - self.g_min)
+                ypix = gear_bottom + vp + gy * (gear_h - 2 * vp)
+                gear_pts.append((xpix, ypix))
+            if len(gear_pts) > 1:
+                arcade.draw_line_strip(gear_pts, color, 2)
+                g_end_x, g_end_y = gear_pts[-1]
+                y_off = (i - (len(active_series) - 1) / 2.0) * 10
+                last_gear = gears[-1] if gears and gears[-1] is not None else 0
+                arcade.Text(
+                    f"{code} G{int(last_gear)}",
+                    min(chart_right - 90, g_end_x + 8),
+                    g_end_y + y_off,
+                    color,
+                    9,
+                    bold=True,
+                ).draw()
+
+            # Throttle / Brake
+            th_pts = []
+            br_pts = []
+            for d, th, br in zip(pos, throttle, brake):
+                xpix = to_x(d)
+                if th is not None:
+                    ny = (th - self.th_min) / (self.th_max - self.th_min)
+                    th_pts.append((xpix, ctrl_bottom + vp + ny * (ctrl_h - 2 * vp)))
+                if br is not None:
+                    ny = (br - self.br_min) / (self.br_max - self.br_min)
+                    br_pts.append((xpix, ctrl_bottom + vp + ny * (ctrl_h - 2 * vp)))
+            if len(th_pts) > 1:
+                arcade.draw_line_strip(th_pts, color, 2)
+            if len(br_pts) > 1:
+                arcade.draw_line_strip(br_pts, self._darken_color(color), 2)
+
+            if th_pts:
+                t_end_x, t_end_y = th_pts[-1]
+                y_off = (i - (len(active_series) - 1) / 2.0) * 10
+                t_val = throttle[-1] if throttle and throttle[-1] is not None else 0.0
+                b_val = brake[-1] if brake and brake[-1] is not None else 0.0
+                arcade.Text(
+                    f"{code} T{t_val:.0f}/B{b_val:.0f}",
+                    min(chart_right - 140, t_end_x + 8),
+                    t_end_y + y_off,
+                    color,
+                    9,
+                ).draw()
+
+            latest_tel = frames[idx].get("telemetry", {}) if isinstance(frames[idx], dict) else {}
+            legend_entries.append(
+                (
+                    code,
+                    color,
+                    float(self._pick_telemetry_value(latest_tel, "speed") or 0.0),
+                    int(self._pick_telemetry_value(latest_tel, "gear", "nGear", "Gear") or 0),
+                    float(self._pick_telemetry_value(latest_tel, "throttle") or 0.0),
+                    float(self._pick_telemetry_value(latest_tel, "brake") or 0.0),
+                )
+            )
+
+        # Dedicated legend block so chart lines and labels do not overlap.
+        if legend_entries:
+            lg_w = 360
+            lg_h = 22 + 18 * len(legend_entries)
+            lg_left = chart_right - lg_w - 8
+            lg_top = speed_top - 2
+            lg_rect = arcade.XYWH(lg_left + lg_w / 2, lg_top - lg_h / 2, lg_w, lg_h)
+            arcade.draw_rect_filled(lg_rect, (15, 15, 15, 215))
+            arcade.draw_rect_outline(lg_rect, arcade.color.GRAY, 1)
+            arcade.Text("Multi-driver overlay", lg_left + 8, lg_top - 14, arcade.color.ANTI_FLASH_WHITE, 10, bold=True).draw()
+            y = lg_top - 30
+            for code, color, spd, gear, th, br in legend_entries:
+                arcade.draw_line(lg_left + 8, y + 6, lg_left + 24, y + 6, color, 3)
+                arcade.draw_line(lg_left + 28, y + 6, lg_left + 42, y + 6, self._darken_color(color), 3)
+                arcade.Text(
+                    f"{code}  S:{spd:>3.0f}  G:{gear}  TH:{th:>3.0f}%  BR:{br:>3.0f}%",
+                    lg_left + 48,
+                    y,
+                    arcade.color.WHITE,
+                    10,
+                ).draw()
+                y -= 18
+
+    def _draw_multi_driver_comparison_panel(self, left: float, top: float) -> None:
+        """Draw side-by-side telemetry comparison for 2+ selected drivers."""
+        telemetry_store = self.data.get("telemetry") if isinstance(self.data, dict) else None
+        if not isinstance(telemetry_store, dict):
+            return
+
+        compare_codes: list[str] = []
+        if self.loaded_driver_code:
+            compare_codes.append(self.loaded_driver_code)
+
+        for code in getattr(self, "selected_drivers", []) or []:
+            if code and code not in compare_codes:
+                compare_codes.append(code)
+
+        if len(compare_codes) < 2:
+            return
+
+        segment = self.loaded_driver_segment or "Q3"
+        rows: list[dict[str, Any]] = []
+        for code in compare_codes[:6]:
+            driver_block = telemetry_store.get(code, {}) if isinstance(telemetry_store.get(code, {}), dict) else {}
+            seg_block = driver_block.get(segment) if isinstance(driver_block, dict) else None
+
+            if not isinstance(seg_block, dict) or not seg_block.get("frames"):
+                for fallback in ("Q3", "Q2", "Q1"):
+                    cand = driver_block.get(fallback) if isinstance(driver_block, dict) else None
+                    if isinstance(cand, dict) and cand.get("frames"):
+                        seg_block = cand
+                        break
+
+            if not isinstance(seg_block, dict):
+                continue
+
+            frames = seg_block.get("frames") or []
+            if not frames:
+                continue
+
+            idx = min(self.frame_index, len(frames) - 1)
+            tel = frames[idx].get("telemetry", {}) if isinstance(frames[idx], dict) else {}
+            speed = self._pick_telemetry_value(tel, "speed")
+            gear = self._pick_telemetry_value(tel, "gear", "nGear", "Gear")
+            throttle = self._pick_telemetry_value(tel, "throttle")
+            brake = self._pick_telemetry_value(tel, "brake")
+            rel_dist = self._pick_telemetry_value(tel, "rel_dist")
+
+            color = arcade.color.WHITE
+            for r in self.data.get("results", []):
+                if r.get("code") == code and r.get("color"):
+                    color = tuple(r.get("color"))
+                    break
+
+            rows.append({
+                "code": code,
+                "speed": float(speed) if speed is not None else 0.0,
+                "gear": int(gear) if gear is not None else 0,
+                "throttle": float(throttle) if throttle is not None else 0.0,
+                "brake": float(brake) if brake is not None else 0.0,
+                "rel_dist": float(rel_dist) if rel_dist is not None else 0.0,
+                "color": color,
+            })
+
+        if len(rows) < 2:
+            return
+
+        rows.sort(key=lambda x: x["speed"], reverse=True)
+        fastest = rows[0]["speed"] if rows else 0.0
+
+        panel_w = 430
+        row_h = 24
+        panel_h = 36 + row_h * (len(rows) + 1)
+        cx = left + panel_w / 2
+        cy = top - panel_h / 2
+        panel_rect = arcade.XYWH(cx, cy, panel_w, panel_h)
+        arcade.draw_rect_filled(panel_rect, (10, 10, 10, 220))
+        arcade.draw_rect_outline(panel_rect, arcade.color.GRAY, 1)
+
+        arcade.Text("Multi-Driver Turn Compare (Shift+Click leaderboard)", left + 10, top - 10, arcade.color.ANTI_FLASH_WHITE, 12, bold=True).draw()
+        arcade.Text("DRV   SPEED   ΔFAST   GEAR   THR   BRK   DIST%", left + 10, top - 32, arcade.color.LIGHT_GRAY, 10).draw()
+
+        y = top - 54
+        for row in rows:
+            delta = row["speed"] - fastest
+            delta_text = f"{delta:+.1f}"
+            line = (
+                f"{row['code']:>3}   "
+                f"{row['speed']:>5.0f}   "
+                f"{delta_text:>6}   "
+                f"{row['gear']:>4}   "
+                f"{row['throttle']:>3.0f}%   "
+                f"{row['brake']:>3.0f}%   "
+                f"{row['rel_dist']*100:>5.1f}"
+            )
+            arcade.Text(line, left + 10, y, row["color"], 10).draw()
+            y -= row_h
+
+    def _detect_track_corners(self) -> list[dict[str, float | int]]:
+        """Detect turn apexes from reference line curvature and return corner markers."""
+        if len(self._ref_xs) < 30:
+            return []
+
+        step = 6
+        min_sep = 80
+        curvatures: list[float] = [0.0] * len(self._ref_xs)
+
+        for i in range(step, len(self._ref_xs) - step):
+            x0, y0 = self._ref_xs[i - step], self._ref_ys[i - step]
+            x1, y1 = self._ref_xs[i], self._ref_ys[i]
+            x2, y2 = self._ref_xs[i + step], self._ref_ys[i + step]
+
+            v1 = np.array([x1 - x0, y1 - y0], dtype=float)
+            v2 = np.array([x2 - x1, y2 - y1], dtype=float)
+            n1 = np.linalg.norm(v1)
+            n2 = np.linalg.norm(v2)
+            if n1 <= 1e-6 or n2 <= 1e-6:
+                continue
+            cosang = float(np.dot(v1, v2) / (n1 * n2))
+            cosang = max(-1.0, min(1.0, cosang))
+            curvatures[i] = abs(np.arccos(cosang))
+
+        curv_arr = np.array(curvatures)
+        non_zero = curv_arr[curv_arr > 0]
+        if non_zero.size == 0:
+            return []
+        threshold = float(np.percentile(non_zero, 82))
+
+        candidate_idx = [i for i, c in enumerate(curvatures) if c >= threshold]
+        candidate_idx.sort(key=lambda i: curvatures[i], reverse=True)
+
+        selected: list[int] = []
+        for idx in candidate_idx:
+            if all(min(abs(idx - s), len(self._ref_xs) - abs(idx - s)) >= min_sep for s in selected):
+                selected.append(idx)
+
+        selected.sort()
+        corners: list[dict[str, float | int]] = []
+        for n, idx in enumerate(selected, start=1):
+            apex_rel = float(self._ref_cumdist[idx] / self._ref_total_length) if self._ref_total_length > 0 else 0.0
+            corners.append({"turn": n, "idx": idx, "apex_rel": apex_rel})
+        return corners
+
+    @staticmethod
+    def _rel_in_window(rel: float, center: float, half: float) -> bool:
+        """Check circular [0..1] window membership around a center point."""
+        low = center - half
+        high = center + half
+        if low < 0:
+            return rel >= (1.0 + low) or rel <= high
+        if high > 1:
+            return rel >= low or rel <= (high - 1.0)
+        return low <= rel <= high
+
+    def _corner_metric_from_frames(self, frames: list[dict[str, Any]], apex_rel: float) -> float | None:
+        """Compute selected corner metric around an apex location."""
+        mode = self.corner_metric_modes[self.corner_metric_mode_index]
+        speeds: list[tuple[float, float]] = []  # (rel_dist, speed)
+        for fr in frames:
+            tel = fr.get("telemetry", {}) if isinstance(fr, dict) else {}
+            rel = self._pick_telemetry_value(tel, "rel_dist")
+            spd = self._pick_telemetry_value(tel, "speed")
+            if rel is None or spd is None:
+                continue
+            rel_f = float(rel)
+            if rel_f > 1.0:
+                rel_f = rel_f / 100.0 if rel_f <= 100.0 else rel_f % 1.0
+            speeds.append((rel_f, float(spd)))
+
+        if not speeds:
+            return None
+
+        def _circular_delta(a: float, b: float) -> float:
+            d = abs(a - b)
+            return min(d, 1.0 - d)
+
+        if mode == "minimum":
+            vals = [s for r, s in speeds if self._rel_in_window(r, apex_rel, 0.018)]
+            return min(vals) if vals else None
+
+        if mode == "apex":
+            best = min(speeds, key=lambda rs: _circular_delta(rs[0], apex_rel))
+            return best[1]
+
+        if mode == "entry":
+            center = (apex_rel - 0.025) % 1.0
+            vals = [s for r, s in speeds if self._rel_in_window(r, center, 0.010)]
+            return float(np.mean(vals)) if vals else None
+
+        # exit
+        center = (apex_rel + 0.025) % 1.0
+        vals = [s for r, s in speeds if self._rel_in_window(r, center, 0.010)]
+        return float(np.mean(vals)) if vals else None
+
+    def _draw_corner_split_panel(self, left: float, top: float) -> None:
+        """Draw true per-corner split view for selected qualifying drivers."""
+        if not self.corner_markers:
+            return
+
+        telemetry_store = self.data.get("telemetry") if isinstance(self.data, dict) else None
+        if not isinstance(telemetry_store, dict):
+            return
+
+        compare_codes: list[str] = []
+        if self.loaded_driver_code:
+            compare_codes.append(self.loaded_driver_code)
+        for code in getattr(self, "selected_drivers", []) or []:
+            if code and code not in compare_codes:
+                compare_codes.append(code)
+
+        if len(compare_codes) < 2:
+            return
+
+        # Apply stored offset
+        offset = self.panel_positions.get("heatmap", {})
+        left += offset.get("offset_x", 0)
+        top += offset.get("offset_y", 0)
+
+        segment = self.loaded_driver_segment or "Q3"
+        driver_frames: dict[str, list[dict[str, Any]]] = {}
+        driver_color: dict[str, tuple[int, int, int]] = {}
+
+        for code in compare_codes[:5]:
+            block = telemetry_store.get(code, {}) if isinstance(telemetry_store.get(code, {}), dict) else {}
+            seg = block.get(segment) if isinstance(block, dict) else None
+            if not isinstance(seg, dict) or not seg.get("frames"):
+                for fallback in ("Q3", "Q2", "Q1"):
+                    cand = block.get(fallback) if isinstance(block, dict) else None
+                    if isinstance(cand, dict) and cand.get("frames"):
+                        seg = cand
+                        break
+            if not isinstance(seg, dict):
+                continue
+
+            frames = seg.get("frames") or []
+            if not frames:
+                continue
+            driver_frames[code] = frames
+
+            clr = arcade.color.WHITE
+            for r in self.data.get("results", []):
+                if r.get("code") == code and r.get("color"):
+                    clr = tuple(r.get("color"))
+                    break
+            driver_color[code] = clr
+
+        if len(driver_frames) < 2:
+            return
+
+        shown_corners = self.corner_markers[:10]
+        codes = list(driver_frames.keys())
+        panel_w = 430
+        row_h = 20
+        header_h = 56
+        panel_h = header_h + row_h * len(shown_corners)
+        cx = left + panel_w / 2
+        cy = top - panel_h / 2
+
+        # Store panel bounds for mouse hit detection
+        self.heatmap_panel_bounds = {"left": left, "top": top, "width": panel_w, "height": panel_h}
+
+        panel_rect = arcade.XYWH(cx, cy, panel_w, panel_h)
+        arcade.draw_rect_filled(panel_rect, (10, 10, 10, 220))
+        arcade.draw_rect_outline(panel_rect, arcade.color.GRAY, 1)
+
+        # Draw draggable handle on header
+        handle_rect = arcade.XYWH(left + 5, top - 20, 20, 15)
+        arcade.draw_rect_filled(handle_rect, (80, 80, 80, 200))
+        arcade.draw_rect_outline(handle_rect, (120, 120, 120), 1)
+        arcade.Text("⋮⋮", left + 8, top - 12, arcade.color.LIGHT_GRAY, 8).draw()
+
+        mode = self.corner_metric_modes[self.corner_metric_mode_index].upper()
+        arcade.Text(f"Per-Corner Split Heatmap ({mode} speed)", left + 10, top - 10, arcade.color.ANTI_FLASH_WHITE, 12, bold=True).draw()
+        arcade.Text("Press T to switch metric", left + 10, top - 28, arcade.color.LIGHT_GRAY, 10).draw()
+
+        heat_left = left + 72
+        heat_w = panel_w - 80
+        col_w = heat_w / max(1, len(codes))
+
+        for idx, code in enumerate(codes):
+            cxh = heat_left + idx * col_w + col_w / 2
+            arcade.Text(code, cxh, top - 44, driver_color.get(code, arcade.color.WHITE), 9, anchor_x="center").draw()
+
+        y = top - 64
+        for corner in shown_corners:
+            turn = int(corner["turn"])
+            apex_rel = float(corner["apex_rel"])
+            vals: dict[str, float] = {}
+            for code, frames in driver_frames.items():
+                v = self._corner_metric_from_frames(frames, apex_rel)
+                if v is not None:
+                    vals[code] = v
+
+            arcade.Text(f"T{turn:>2}", left + 10, y, arcade.color.ANTI_FLASH_WHITE, 10).draw()
+
+            baseline_code = self.loaded_driver_code if self.loaded_driver_code in vals else (codes[0] if codes and codes[0] in vals else None)
+            baseline = vals.get(baseline_code) if baseline_code else None
+            best = max(vals.values()) if vals else None
+
+            for idx, code in enumerate(codes):
+                cxh = heat_left + idx * col_w + col_w / 2
+                val = vals.get(code)
+                if val is None:
+                    arcade.draw_rect_filled(arcade.XYWH(cxh, y + 2, col_w - 4, row_h - 6), (50, 50, 50, 180))
+                    continue
+
+                if baseline is not None:
+                    delta = val - baseline
+                elif best is not None:
+                    delta = val - best
+                else:
+                    delta = 0.0
+
+                norm = max(-1.0, min(1.0, delta / 12.0))
+                if norm >= 0:
+                    color = (int(40 + 160 * norm), int(80 + 160 * norm), 50, 220)
+                else:
+                    n = abs(norm)
+                    color = (int(80 + 170 * n), int(40 + 70 * (1 - n)), int(40 + 50 * (1 - n)), 220)
+
+                arcade.draw_rect_filled(arcade.XYWH(cxh, y + 2, col_w - 4, row_h - 6), color)
+                arcade.Text(f"{val:.0f}", cxh, y + 1, arcade.color.WHITE, 9, anchor_x="center").draw()
+
+            y -= row_h
+
     def on_mouse_press(self, x: float, y: float, button: int, modifiers: int):
+        # Check if clicking on a draggable panel handle
+        if hasattr(self, 'heatmap_panel_bounds') and self.heatmap_panel_bounds:
+            bounds = self.heatmap_panel_bounds
+            if (bounds["left"] + 5 <= x <= bounds["left"] + 25 and
+                bounds["top"] - 20 <= y <= bounds["top"]):
+                self.dragging_panel = "heatmap"
+                self.drag_start_x = x
+                self.drag_start_y = y
+                self.drag_start_panel_x = self.panel_positions["heatmap"]["offset_x"]
+                self.drag_start_panel_y = self.panel_positions["heatmap"]["offset_y"]
+                return
+
         # If the segment-selector modal is visible (a driver selected), give it first chance
         # to handle the click (so its close button can work). If it handled the click,
         # stop further processing so the leaderboard doesn't re-select the driver.
@@ -798,6 +1268,18 @@ class QualifyingReplay(arcade.Window):
         elif symbol == arcade.key.D:
             # Toggle DRS zones on track map
             self.toggle_drs_zones = not self.toggle_drs_zones
+            return
+        elif symbol == arcade.key.T:
+            self.corner_metric_mode_index = (self.corner_metric_mode_index + 1) % len(self.corner_metric_modes)
+            return
+        elif symbol == arcade.key.Y:
+            # Reset all panel positions to default
+            self.panel_positions = {
+                "overlay_charts": {"offset_x": 0, "offset_y": 0},
+                "heatmap": {"offset_x": 0, "offset_y": 0}
+            }
+            self.save_panel_positions()
+            print("✓ Panel positions reset to default")
             return
         elif symbol == arcade.key.H:
             # Toggle Controls popup with 'H' key — show anchored to bottom-left with 20px margin
@@ -865,6 +1347,7 @@ class QualifyingReplay(arcade.Window):
                     self.loaded_telemetry = seg
                     self.loaded_driver_code = driver_code
                     self.loaded_driver_segment = segment_name
+                    self.selected_drivers = [driver_code]
                     self.chart_active = True
                     # cache arrays for fast access and search
                     frames = seg.get("frames", [])
@@ -941,6 +1424,7 @@ class QualifyingReplay(arcade.Window):
                 self.loaded_telemetry = telemetry
                 self.loaded_driver_code = driver_code
                 self.loaded_driver_segment = segment_name
+                self.selected_drivers = [driver_code]
                 self.chart_active = True
                 # cache arrays for fast indexing/interpolation
                 frames = telemetry.get("frames", [])
@@ -1030,6 +1514,11 @@ class QualifyingReplay(arcade.Window):
             self.is_forwarding = False
             self.is_rewinding = False
             self.paused = self.was_paused_before_hold
+        
+        # End panel dragging
+        if self.dragging_panel:
+            self.save_panel_positions()
+            self.dragging_panel = None
 
 def run_qualifying_replay(session, data, title="Qualifying Results", ready_file=None):
     window = QualifyingReplay(session=session, data=data, title=title)
